@@ -1210,6 +1210,7 @@ if [[ "$ENABLE_TELEMT" == "yes" ]]; then
 fast_mode        = true
 use_middle_proxy = true
 log_level        = "normal"
+tg_connect       = 10
 
 [general.modes]
 classic = false
@@ -1225,6 +1226,11 @@ public_port = 443
 ipv4   = true
 ipv6   = false
 prefer = 4
+
+# Таймауты (по мотивам MTproxy-reanimation) — помогают против «handshake timeout»
+[timeouts]
+client_handshake = 15
+client_keepalive = 60
 
 [server]
 port           = $TELEMT_PORT
@@ -1489,6 +1495,52 @@ EOF
         inb_nginx_reload || true
         log "Inbound nginx переключён на сертификат Let's Encrypt"
     fi
+fi
+
+# ==============================================================================
+# ШАГ 11и. Анти-DPI: per-IP SYN rate-limit на :443 (по мотивам MTproxy-reanimation)
+# ==============================================================================
+# Ограничивает темп НОВЫХ соединений с одного IP (1 SYN/с) — снижает «handshake
+# timeout» и сбивает активное зондирование DPI. Висит отдельной nftables-таблицей,
+# не конфликтует с ufw. Отключить: systemctl disable --now telemt-ratelimit.
+log "--- Шаг 11и: nftables SYN rate-limit на :443 ---"
+apt_install nftables
+systemctl enable --now nftables >/dev/null 2>&1 || true
+
+deploy_file /etc/nftables-telemt.nft 644 <<'EOF' >/dev/null || true
+#!/usr/sbin/nft -f
+add table inet telemt_limit
+delete table inet telemt_limit
+table inet telemt_limit {
+    chain input {
+        type filter hook input priority -150; policy accept;
+        tcp dport 443 tcp flags & (syn | ack) == syn meter mtpr_syn { ip saddr timeout 60s limit rate over 1/second burst 1 packets } counter drop comment "mtpr_syn_ratelimit"
+    }
+}
+EOF
+
+deploy_file /etc/systemd/system/telemt-ratelimit.service 644 <<'EOF' >/dev/null || true
+[Unit]
+Description=telemt per-IP SYN rate-limit (nftables)
+After=nftables.service network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/nft -f /etc/nftables-telemt.nft
+ExecStop=/usr/sbin/nft delete table inet telemt_limit
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+if systemctl enable --now telemt-ratelimit.service >/dev/null 2>&1; then
+    systemctl restart telemt-ratelimit.service 2>/dev/null || true
+    log "SYN rate-limit активен (1/с на IP, порт 443)"
+else
+    warn "Не удалось включить telemt-ratelimit.service — проверьте: nft -f /etc/nftables-telemt.nft"
 fi
 
 CERT_DESC="$INB_CERT_DESC"
